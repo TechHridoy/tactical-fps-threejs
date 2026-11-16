@@ -2,7 +2,7 @@
 // APIs only: the game asks the canvas for pointer lock and reads movementX/Y while it holds it.
 export function createInput(canvas, onLockChange) {
   const keys = new Set();
-  const state = { keys, locked: false, firing: false, lookX: 0, lookY: 0 };
+  const state = { keys, locked: false, firing: false, aiming: false, lookX: 0, lookY: 0 };
 
   function setKey(event, down) {
     if (down) keys.add(event.code);
@@ -19,16 +19,22 @@ export function createInput(canvas, onLockChange) {
     state.lookY += event.movementY;
   });
   window.addEventListener('mousedown', (event) => {
-    if (state.locked && event.button === 0) state.firing = true;
+    if (!state.locked) return;
+    if (event.button === 0) state.firing = true;
+    if (event.button === 2) state.aiming = true;
   });
   window.addEventListener('mouseup', (event) => {
     if (event.button === 0) state.firing = false;
+    if (event.button === 2) state.aiming = false;
   });
+  // Right-click aims down sights; never open the browser menu in game.
+  window.addEventListener('contextmenu', (event) => event.preventDefault());
   document.addEventListener('pointerlockchange', () => {
     state.locked = document.pointerLockElement === canvas;
     if (!state.locked) {
       keys.clear();
       state.firing = false;
+      state.aiming = false;
     }
     onLockChange(state.locked);
   });

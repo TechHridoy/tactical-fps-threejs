@@ -49,6 +49,13 @@ export function createWeapon(camera) {
 
   let def = WEAPONS.longbow;
   const state = { mag: def.mag, reserve: def.reserve, cooldown: 0, reloadLeft: 0, flash: 0, kick: 0, id: def.id };
+  let aiming = false;
+  let aimBlend = 0;
+  let walkCycle = 0;
+  // Hip and aim-down-sights viewmodel anchors; ADS centres the weapon and
+  // pulls it closer so the sight line sits on the crosshair.
+  const HIP_POS = { x: 0.24, y: -0.2, z: -0.42 };
+  const ADS_POS = { x: 0, y: -0.135, z: -0.3 };
 
   function rebuildModel() {
     while (model.children.length) model.remove(model.children[0]);
@@ -80,12 +87,22 @@ export function createWeapon(camera) {
   }
   rebuildModel();
 
-  function step(dt) {
+  function step(dt, speed = 0) {
     state.cooldown = Math.max(0, state.cooldown - dt);
     state.flash = Math.max(0, state.flash - dt);
     state.kick += (0 - state.kick) * Math.min(1, dt * 14);
-    model.position.z = -0.42 + state.kick;
+    // ADS blend: snappy in, a touch slower out.
+    aimBlend += ((aiming ? 1 : 0) - aimBlend) * Math.min(1, dt * (aiming ? 14 : 9));
+    // Walk sway: the viewmodel bobs and sways with the player's stride.
+    walkCycle += dt * (2 + speed * 1.7);
+    const sway = Math.min(1, speed / 5.2) * (1 - aimBlend * 0.85);
+    const bobY = Math.sin(walkCycle * 2) * 0.008 * sway;
+    const bobX = Math.cos(walkCycle) * 0.006 * sway;
+    model.position.x = HIP_POS.x + (ADS_POS.x - HIP_POS.x) * aimBlend + bobX;
+    model.position.y = HIP_POS.y + (ADS_POS.y - HIP_POS.y) * aimBlend + bobY;
+    model.position.z = HIP_POS.z + (ADS_POS.z - HIP_POS.z) * aimBlend + state.kick;
     model.rotation.x = state.kick * 2.2;
+    model.rotation.z = bobX * 0.9;
     flash.visible = state.flash > 0;
     flash.rotation.z = state.flash * 30;
     flashLight.intensity = state.flash > 0 ? 18 : 0;
@@ -104,6 +121,9 @@ export function createWeapon(camera) {
   return {
     state, def: () => def,
     step,
+    setAiming(v) { aiming = !!v; },
+    isAiming() { return aimBlend > 0.5; },
+    aimBlend() { return aimBlend; },
     ready() { return state.mag > 0 && state.cooldown === 0 && state.reloadLeft === 0; },
     pullTrigger() { state.cooldown = def.fireGap; state.flash = 0.06; state.kick = def.id === 'horizon' ? 0.12 : 0.055; },
     takeRound() { if (state.mag <= 0) return false; state.mag -= 1; return true; },

@@ -18,6 +18,8 @@ export function createHud() {
   const buyMenu = $('buy-menu'), buyGrid = $('buy-grid'), damage = $('damage');
   const captureWrap = $('capture'), captureFill = $('capture-fill'), captureLabel = $('capture-label');
   const minimap = $('minimap');
+  const crosshair = $('crosshair');
+  const crossArms = crosshair ? crosshair.querySelectorAll('i') : [];
   let hitTimer = 0, bannerTimer = 0, damageTimer = 0;
   let last = {};
 
@@ -40,6 +42,17 @@ export function createHud() {
   let buyHandler = null;
 
   return {
+    // Crosshair spread: the four arms open up with movement and firing, and
+    // close down to a tight dot while aiming. gap is in px from centre.
+    setCrosshair(gap, aiming = false) {
+      if (!crosshair || crossArms.length < 4) return;
+      const g = Math.max(2, Math.min(18, gap));
+      crossArms[0].style.top = `${11 - g - 7}px`;
+      crossArms[1].style.top = `${11 + g}px`;
+      crossArms[2].style.left = `${11 - g - 7}px`;
+      crossArms[3].style.left = `${11 + g}px`;
+      crosshair.style.opacity = aiming ? '0.4' : '0.85';
+    },
     setHealth(hp) {
       setText(healthNum, 'hp', String(Math.max(0, Math.round(hp))));
       if (healthFill) healthFill.style.width = `${Math.max(0, hp)}%`;

@@ -61,6 +61,11 @@ export function createBots(scene, world) {
       waypoint: null, strafeDir: 1, strafeAt: 0,
       shootAt: 0, burstLeft: 0, burstAt: 0, thinkAt: 0, target: null,
       home: new THREE.Vector3(spawn[0], 0, spawn[1]),
+      // Damage reaction + memory: where the last hit came from, and where
+      // the last enemy was seen, so a bot can flinch, peek and reposition.
+      hurtAt: -9, hurtFrom: new THREE.Vector3(),
+      lastSeenPos: null, lastSeenAt: -9,
+      prevWpDist: 0, stuckCount: 0, pair: null,
     };
     body.torso.userData.bot = bot;
     body.head.userData.bot = bot;
@@ -70,6 +75,20 @@ export function createBots(scene, world) {
   }
   EMBER_NAMES.forEach((n, i) => addBot('ember', n, EMBER_SPAWN[i], WEAPON_ORDER[1 + (i % 3)]));
   TIDE_NAMES.forEach((n, i) => addBot('tide', n, TIDE_SPAWN[i], i === 0 ? 'horizon' : WEAPON_ORDER[1 + (i % 3)]));
+  // Pairs move together: each bot's partner shares its site, and a bot
+  // that drifts from its partner regroups on them before pushing a site.
+  function pairUp(list) {
+    for (let i = 0; i + 1 < list.length; i += 2) {
+      list[i].pair = list[i + 1];
+      list[i + 1].pair = list[i];
+      list[i + 1].site = list[i].site;
+    }
+  }
+  pairUp(bots.filter((b) => b.team === 'ember'));
+  pairUp(bots.filter((b) => b.team === 'tide'));
+
+  // Clock of the latest step, so damage() can stamp when a hit landed.
+  let lastTime = 0;
 
   function reset() {
     for (const bot of bots) {
@@ -81,6 +100,8 @@ export function createBots(scene, world) {
       bot.yaw = bot.team === 'ember' ? Math.PI : 0;
       bot.site = Math.random() < 0.5 ? SITES.A : SITES.B;
       bot.waypoint = null; bot.target = null; bot.shootAt = 0; bot.burstLeft = 0;
+      bot.hurtAt = -9; bot.lastSeenPos = null; bot.lastSeenAt = -9;
+      bot.stuckCount = 0; bot.prevWpDist = 0;
       bot.barFg.scale.x = 1;
       bot.barFg.position.x = 0;
     }
@@ -99,6 +120,7 @@ export function createBots(scene, world) {
   //        damageBot(bot,amount,attackerName,part), damagePlayer(amount,attackerName),
   //        onBotShot(bot), aliveOf(team) }
   function step(ctx) {
+    lastTime = ctx.time;
     for (const bot of bots) {
       if (!bot.alive) {
         bot.fall = Math.min(1, bot.fall + ctx.dt / 0.4);
@@ -129,6 +151,10 @@ export function createBots(scene, world) {
             const key = foe.kind === 'player' ? 'player' : `bot:${foe.bot.name}`;
             if (bot.targetKey !== key) { bot.aimAt = ctx.time + 0.45; bot.targetKey = key; }
             bot.target = foe;
+            // Remember where the enemy was seen: losing line of sight
+            // makes the bot peek toward that spot instead of wandering off.
+            bot.lastSeenPos = new THREE.Vector3(foe.pos.x, 0, foe.pos.z);
+            bot.lastSeenAt = ctx.time;
             break;
           }
         }
@@ -138,14 +164,25 @@ export function createBots(scene, world) {
         const t = bot.target.pos;
         const dx = t.x - bot.pos.x; const dz = t.z - bot.pos.z;
         bot.yaw = Math.atan2(dx, dz);
+        // Hurt reaction: for a moment after taking a hit the bot flinches
+        // (no firing) and breaks away from where the shot came from.
+        const hurt = ctx.time - bot.hurtAt < 0.7;
+        if (hurt) {
+          const ax = bot.pos.x - bot.hurtFrom.x; const az = bot.pos.z - bot.hurtFrom.z;
+          const al = Math.hypot(ax, az) || 1;
+          const fx = bot.pos.x + (ax / al) * bot.speed * 1.25 * ctx.dt;
+          const fz = bot.pos.z + (az / al) * bot.speed * 1.25 * ctx.dt;
+          if (!world.blockedAt(fx, fz, 0.4)) { bot.pos.x = fx; bot.pos.z = fz; }
+        }
         // Strafe sideways, flip direction every ~1.2 s.
         if (ctx.time > bot.strafeAt) { bot.strafeDir *= -1; bot.strafeAt = ctx.time + 0.9 + Math.random() * 0.8; }
         const sx = Math.cos(bot.yaw) * bot.strafeDir; const sz = -Math.sin(bot.yaw) * bot.strafeDir;
         const nx = bot.pos.x + sx * bot.speed * 0.45 * ctx.dt;
         const nz = bot.pos.z + sz * bot.speed * 0.45 * ctx.dt;
         if (!world.blockedAt(nx, nz, 0.4)) { bot.pos.x = nx; bot.pos.z = nz; }
-        // Fire in short bursts, only after the reaction delay.
-        if (ctx.time >= bot.shootAt && ctx.time >= (bot.aimAt || 0)) {
+        // Fire in short bursts, only after the reaction delay — and not
+        // while flinching from a fresh hit.
+        if (ctx.time >= bot.shootAt && ctx.time >= (bot.aimAt || 0) && !hurt) {
           bot.burstLeft = bot.weapon.id === 'horizon' ? 1 : 2 + Math.floor(Math.random() * 2);
           bot.shootAt = ctx.time + (bot.weapon.id === 'horizon' ? 2.0 : 1.1) + Math.random() * 0.9;
           bot.burstAt = ctx.time;
@@ -164,15 +201,37 @@ export function createBots(scene, world) {
           }
         }
       } else {
-        // --- move to objective: Ember attacks a site, Tide holds one / patrols Mid
-        const goal = bot.team === 'ember'
-          ? { x: bot.site.x + (Math.random() < 0.3 ? 2 : 0), z: bot.site.z }
-          : (bot.health < 45 ? { x: bot.site.x, z: bot.site.z } : { x: (bot.site.x + 0) / 2, z: -4 });
+        // --- move to objective. A bot with a live partner shares the
+        // partner's site and regroups on them when separated; a bot that
+        // recently lost sight of an enemy peeks toward where it last saw
+        // them; otherwise Ember attacks a site and Tide holds one.
+        let goal;
+        if (bot.pair && bot.pair.alive) {
+          bot.site = bot.pair.site;
+          const pd = Math.hypot(bot.pair.pos.x - bot.pos.x, bot.pair.pos.z - bot.pos.z);
+          goal = pd > 4
+            ? { x: bot.pair.pos.x, z: bot.pair.pos.z }
+            : { x: bot.site.x, z: bot.site.z };
+        } else if (bot.lastSeenPos && ctx.time - bot.lastSeenAt < 4) {
+          goal = { x: bot.lastSeenPos.x, z: bot.lastSeenPos.z };
+        } else {
+          goal = bot.team === 'ember'
+            ? { x: bot.site.x + (Math.random() < 0.3 ? 2 : 0), z: bot.site.z }
+            : (bot.health < 45 ? { x: bot.site.x, z: bot.site.z } : { x: (bot.site.x + 0) / 2, z: -4 });
+        }
         if (!bot.waypoint || Math.hypot(bot.waypoint[0] - bot.pos.x, bot.waypoint[1] - bot.pos.z) < 1.2) {
           bot.waypoint = nearestWaypoint(bot.pos, goal);
           // If already close to the goal, walk straight at it.
           if (Math.hypot(goal.x - bot.pos.x, goal.z - bot.pos.z) < 4) bot.waypoint = [goal.x, goal.z];
         }
+        // Stuck watch: if the waypoint is not getting closer, drop it and
+        // let the next think pick a fresh route instead of grinding a wall.
+        const wpD = Math.hypot(bot.waypoint[0] - bot.pos.x, bot.waypoint[1] - bot.pos.z);
+        if (wpD > bot.prevWpDist - 0.005) {
+          bot.stuckCount += 1;
+          if (bot.stuckCount > 45) { bot.waypoint = null; bot.stuckCount = 0; bot.prevWpDist = 0; }
+        } else bot.stuckCount = 0;
+        bot.prevWpDist = wpD;
         const wx = bot.waypoint[0] - bot.pos.x; const wz = bot.waypoint[1] - bot.pos.z;
         const len = Math.hypot(wx, wz) || 1;
         const stepLen = bot.speed * ctx.dt;
@@ -210,9 +269,12 @@ export function createBots(scene, world) {
     }
   }
 
-  function damage(bot, amount) {
+  function damage(bot, amount, fromPos = null) {
     if (!bot.alive) return false;
     bot.health -= amount;
+    // Remember the hit: the brain flinches and breaks away from the shooter.
+    bot.hurtAt = lastTime;
+    if (fromPos) bot.hurtFrom.set(fromPos.x, 0, fromPos.z);
     if (bot.health > 0) return false;
     bot.health = 0; bot.alive = false; bot.fall = 0;
     return true;

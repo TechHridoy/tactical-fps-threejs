@@ -11,6 +11,7 @@ import { createWeapon, WEAPONS } from './weapons.js';
 import { createBots } from './bots.js';
 import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
+import { createEffects } from './effects.js';
 
 const FIXED_STEP = 1 / 60;
 const WIN_ROUNDS = 5;
@@ -39,6 +40,10 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// Filmic tone mapping: the dusk sun and amber glare roll off instead of
+// clipping, and the shadows keep their depth.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.35;
 document.getElementById('game').appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -52,6 +57,7 @@ const bots = createBots(scene, world);
 const weapon = createWeapon(camera);
 const hud = createHud();
 const audio = createAudio();
+const effects = createEffects(scene);
 const player = createPlayer(world.colliders);
 const input = createInput(renderer.domElement, onLockChange);
 const raycaster = new THREE.Raycaster();
@@ -74,10 +80,19 @@ let accumulator = 0;
 let lastTime = performance.now();
 let prevFiring = false;
 let matchOver = false;
+let shake = 0; // camera shake from firing, decays fast
+const BASE_FOV = 74;
+const ADS_FOV = 55;
 
 function syncCamera() {
   camera.position.set(body.position.x, body.position.y + body.eye, body.position.z);
-  camera.rotation.set(body.pitch, body.yaw, 0, 'YXZ');
+  // Shake is a small random offset on top of the player's aim, never a
+  // change to the aim itself — it settles back to zero on its own.
+  const sh = shake * 0.02;
+  camera.rotation.set(
+    body.pitch + (Math.random() - 0.5) * sh,
+    body.yaw + (Math.random() - 0.5) * sh,
+    0, 'YXZ');
 }
 function syncHud() {
   hud.setHealth(game.health);
@@ -157,7 +172,9 @@ function damagePlayer(amount, attacker) {
   syncHud();
 }
 function damageBot(bot, amount, attacker, part) {
-  const killed = bots.damage(bot, amount);
+  // The hit is stamped with where the shot came from, so the bot reacts.
+  const from = attacker === 'You' ? body.position : (bots.bots.find((b) => b.name === attacker) || {}).pos || body.position;
+  const killed = bots.damage(bot, amount, from);
   if (killed) {
     hud.killfeed(`${attacker} eliminated ${bot.name} (Tide)${part === 'head' ? ' — headshot' : ''}`);
     if (attacker === 'You') { game.money += 300; game.kills += 1; }
@@ -197,6 +214,15 @@ function shoot(spread) {
   scene.updateMatrixWorld(true);
   raycaster.set(camera.position, direction);
   const hit = raycaster.intersectObjects(world.shootables.concat(bots.hitMeshes), false)[0];
+  // Muzzle in world space, so the tracer starts at the gun, not the eye.
+  const muzzle = camera.localToWorld(new THREE.Vector3(0.24, -0.18, -0.95));
+  const end = hit ? hit.point : camera.position.clone().addScaledVector(direction, 60);
+  effects.spawnTracer(muzzle, end);
+  if (hit) {
+    // Sparks where the round lands — on a bot or on the map.
+    const normal = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : new THREE.Vector3(0, 1, 0);
+    effects.spawnSparks(hit.point, normal);
+  }
   if (hit && hit.object.userData.bot) {
     const bot = hit.object.userData.bot;
     const part = hit.object.userData.part || 'torso';
@@ -207,6 +233,8 @@ function shoot(spread) {
   }
   weapon.pullTrigger();
   player.recoil(0.009 + random() * 0.004, (random() * 2 - 1) * 0.004);
+  // Firing kicks the camera: a sharp shake that decays within a frame or two.
+  shake = Math.min(0.6, shake + (weapon.state.id === 'horizon' ? 0.5 : 0.22));
   syncHud();
   return true;
 }
@@ -244,23 +272,32 @@ function step(dt) {
   if (game.phase === 'buy') {
     game.phaseT -= dt;
     player.step(dt, input.state.keys);
-    weapon.step(dt);
+    weapon.step(dt, player.groundSpeed());
     if (game.phaseT <= 0) deploy();
   } else if (game.phase === 'live') {
     game.phaseT -= dt;
     if (game.alive) player.step(dt, input.state.keys);
-    weapon.step(dt);
+    weapon.step(dt, player.groundSpeed());
     bots.step({
       dt, time: elapsed, camera,
       player: { pos: body.position, alive: game.alive, health: game.health },
       hasLOS,
       damageBot: (bot, amount, attacker, part) => {
-        const killed = bots.damage(bot, amount);
+        const killed = damageBot(bot, amount, attacker, part);
         if (killed) hud.killfeed(`${attacker} eliminated ${bot.name} (${bot.team === 'tide' ? 'Tide' : 'Ember'})`);
         return killed;
       },
       damagePlayer,
-      onBotShot: () => audio.enemyShot(),
+      onBotShot: (bot) => {
+        audio.enemyShot();
+        // A faint tracer from the firing bot toward what it shot at.
+        const from = new THREE.Vector3(bot.pos.x, 1.3, bot.pos.z);
+        from.x -= Math.sin(bot.yaw) * 0.3;
+        from.z -= Math.cos(bot.yaw) * 0.3;
+        const target = bot.target ? bot.target.pos : body.position;
+        const to = new THREE.Vector3(target.x, 1.3, target.z);
+        effects.spawnTracer(from, to);
+      },
       aliveOf: (team) => bots.aliveCount(team),
     });
     checkCapture(dt);
@@ -278,7 +315,7 @@ function step(dt) {
     }
   } else if (game.phase === 'roundEnd') {
     game.phaseT -= dt;
-    weapon.step(dt);
+    weapon.step(dt, player.groundSpeed());
     if (game.phaseT <= 0) {
       if (game.ember >= WIN_ROUNDS || game.tide >= WIN_ROUNDS || game.round >= MAX_ROUNDS) endMatch();
       else { game.round += 1; startRound(); }
@@ -293,15 +330,32 @@ function frame(now) {
   if (!frozen) {
     const look = input.takeLook();
     if (game.alive && game.phase !== 'matchEnd') player.look(look.x, look.y);
+    // Aim down sights: right mouse centres the weapon, tightens spread
+    // and zooms the field of view in. It only applies while alive and live.
+    const aiming = input.state.aiming && game.alive && game.phase === 'live';
+    weapon.setAiming(aiming);
+    const targetFov = aiming ? ADS_FOV : BASE_FOV;
+    if (Math.abs(camera.fov - targetFov) > 0.05) {
+      camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 12);
+      camera.updateProjectionMatrix();
+    }
     const firing = input.state.firing && game.phase === 'live' && game.alive && input.state.locked;
     const freshPress = firing && !prevFiring;
     prevFiring = input.state.firing;
-    if (firing && weapon.ready() && (weapon.def().auto || freshPress)) shoot(shot ? 0 : weapon.spread(player.groundSpeed()));
+    const aimSpread = aiming ? 0.45 : 1;
+    if (firing && weapon.ready() && (weapon.def().auto || freshPress)) shoot(shot ? 0 : weapon.spread(player.groundSpeed()) * aimSpread);
     if (input.state.keys.has('KeyR') && weapon.reload()) audio.reload();
     accumulator += dt;
     let steps = 0;
     while (accumulator >= FIXED_STEP && steps < 5) { step(FIXED_STEP); accumulator -= FIXED_STEP; steps += 1; }
     if (accumulator > FIXED_STEP * 5) accumulator = 0;
+    // Camera shake from firing decays in a few frames.
+    shake *= Math.exp(-dt * 9);
+    // Crosshair opens with movement and firing, closes while aiming.
+    const spreadPx = 4 + weapon.spread(player.groundSpeed()) * aimSpread * 500 + (firing ? 3 : 0);
+    hud.setCrosshair(spreadPx, aiming);
+    effects.update(dt);
+    world.update(dt, elapsed);
     syncCamera();
     hud.drawMinimap(world, body.position, bots.bots, SITES);
   }
